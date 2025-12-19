@@ -966,14 +966,14 @@ class LazySupervisedDataset(Dataset):
             file_names = file_pattern.split(",")
             rank0_print(f"Loading {file_names} from {base_path}")
             data_args.dataset_paths = []
-            for file_name in file_names:
-                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                full_path = f"{base_path}{file_name}.json"
-                rank0_print(f"Loading {full_path}")
-                with open(full_path, "r") as file:
-                    cur_data_dict = json.load(file)
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                    self._extend_with_validation(cur_data_dict, full_path)
         elif data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
                 yaml_data = yaml.safe_load(file)
@@ -1022,19 +1022,84 @@ class LazySupervisedDataset(Dataset):
                         cur_data_dict = cur_data_dict[:sampling_number]
 
                     rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+                    self._extend_with_validation(cur_data_dict, json_path)
         else:
             data_args.dataset_paths = [data_path]
             rank0_print(f"Loading {data_path}")
             with open(data_path, "r") as file:
                 cur_data_dict = json.load(file)
                 rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
-                self.list_data_dict.extend(cur_data_dict)
+                self._extend_with_validation(cur_data_dict, data_path)
 
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
+
+    @staticmethod
+    def _validate_conversations(sample, source_path, sample_idx):
+        conversations = sample["conversations"]
+        if not isinstance(conversations, list) or len(conversations) == 0:
+            raise ValueError(
+                f"Sample #{sample_idx} from {source_path} has an empty or invalid 'conversations' value: {conversations}."
+            )
+
+        for conv_idx, conv in enumerate(conversations):
+            if not isinstance(conv, dict) or "value" not in conv:
+                raise ValueError(
+                    f"Sample #{sample_idx} from {source_path} has an invalid conversation entry at index {conv_idx}: {conv}. "
+                    "Each entry must be a dict containing the 'value' key."
+                )
+
+            if not isinstance(conv.get("value"), str):
+                raise ValueError(
+                    f"Sample #{sample_idx} from {source_path} has a non-string 'value' in conversation entry {conv_idx}: {conv}."
+                )
+
+    def _qa_to_conversations(self, sample, source_path, sample_idx):
+        questions = sample.get("questions", [])
+        answers = sample.get("answers", [])
+
+        if not isinstance(questions, list) or not isinstance(answers, list) or len(questions) == 0:
+            raise ValueError(
+                f"Sample #{sample_idx} from {source_path} must contain non-empty 'questions' and 'answers' lists to build conversations."
+            )
+
+        if len(questions) != len(answers):
+            raise ValueError(
+                f"Sample #{sample_idx} from {source_path} has mismatched 'questions' and 'answers' lengths: {len(questions)} vs {len(answers)}."
+            )
+
+        user_role, assistant_role = conversation_lib.default_conversation.roles[:2]
+        conversations = []
+
+        for qa_idx, (question, answer) in enumerate(zip(questions, answers)):
+            if not isinstance(question, str) or not isinstance(answer, str):
+                raise ValueError(
+                    f"Sample #{sample_idx} from {source_path} contains non-string QA pair at index {qa_idx}: {question}, {answer}."
+                )
+
+            question_value = question if qa_idx > 0 else f"{DEFAULT_IMAGE_TOKEN}\n{question}"
+            conversations.append({"from": user_role, "value": question_value})
+            conversations.append({"from": assistant_role, "value": answer})
+
+        normalized_sample = dict(sample)
+        normalized_sample["conversations"] = conversations
+        return normalized_sample
+
+    def _extend_with_validation(self, samples, source_path):
+        for idx, sample in enumerate(samples):
+            if "conversations" not in sample:
+                if "questions" in sample and "answers" in sample:
+                    sample = self._qa_to_conversations(sample, source_path, idx)
+                else:
+                    raise ValueError(
+                        f"Sample #{idx} from {source_path} is missing the 'conversations' field. "
+                        "Please provide 'conversations' or 'questions'/'answers' to build dialogue data."
+                    )
+
+            self._validate_conversations(sample, source_path, idx)
+            self.list_data_dict.append(sample)
 
     def __len__(self):
         return len(self.list_data_dict)
